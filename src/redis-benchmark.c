@@ -39,6 +39,7 @@
 #include <sys/time.h>
 #include <signal.h>
 #include <assert.h>
+#include <math.h>
 
 #include <sds.h> /* Use hiredis sds. */
 #include "ae.h"
@@ -48,6 +49,7 @@
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
+#define MAX_LATENCY_PRECISION 3
 
 static struct config {
     aeEventLoop *el;
@@ -65,6 +67,7 @@ static struct config {
     int randomkeys_keyspacelen;
     int keepalive;
     int pipeline;
+    int showerrors;
     long long start;
     long long totlatency;
     long long *latency;
@@ -78,6 +81,7 @@ static struct config {
     sds dbnumstr;
     char *tests;
     char *auth;
+    int precision;
 } config;
 
 typedef struct _client {
@@ -212,6 +216,16 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     exit(1);
                 }
 
+                if (config.showerrors) {
+                    static time_t lasterr_time = 0;
+                    time_t now = time(NULL);
+                    redisReply *r = reply;
+                    if (r->type == REDIS_REPLY_ERROR && lasterr_time != now) {
+                        lasterr_time = now;
+                        printf("Error from server: %s\n", r->str);
+                    }
+                }
+
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
                 if (c->prefix_pending > 0) {
@@ -227,7 +241,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                             c->randptr[j] -= c->prefixlen;
                         c->prefixlen = 0;
                     }
-                    continue;                
+                    continue;
                 }
 
                 if (config.requests_finished < config.requests)
@@ -417,8 +431,19 @@ static int compareLatency(const void *a, const void *b) {
     return (*(long long*)a)-(*(long long*)b);
 }
 
+static int ipow(int base, int exp) {
+    int result = 1;
+    while (exp) {
+        if (exp & 1) result *= base;
+        exp /= 2;
+        base *= base;
+    }
+    return result;
+}
+
 static void showLatencyReport(void) {
     int i, curlat = 0;
+    int usbetweenlat = ipow(10, MAX_LATENCY_PRECISION-config.precision);
     float perc, reqpersec;
 
     reqpersec = (float)config.requests_finished/((float)config.totlatency/1000);
@@ -433,10 +458,21 @@ static void showLatencyReport(void) {
 
         qsort(config.latency,config.requests,sizeof(long long),compareLatency);
         for (i = 0; i < config.requests; i++) {
-            if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
-                curlat = config.latency[i]/1000;
+            if (config.latency[i]/usbetweenlat != curlat ||
+                i == (config.requests-1))
+            {
+                curlat = config.latency[i]/usbetweenlat;
                 perc = ((float)(i+1)*100)/config.requests;
-                printf("%.2f%% <= %d milliseconds\n", perc, curlat);
+                printf("%.2f%% <= %.*f milliseconds\n", perc, config.precision,
+                    curlat/pow(10.0, config.precision));
+
+                /* After the 2 milliseconds latency to have percentages split
+                 * by decimals will just add a lot of noise to the output. */
+                if (config.latency[i] > 2000) {
+                    config.precision = 0;
+                    usbetweenlat = ipow(10,
+                        MAX_LATENCY_PRECISION-config.precision);
+                }
             }
         }
         printf("%.2f requests per second\n\n", reqpersec);
@@ -518,6 +554,8 @@ int parseOptions(int argc, const char **argv) {
             config.loop = 1;
         } else if (!strcmp(argv[i],"-I")) {
             config.idlemode = 1;
+        } else if (!strcmp(argv[i],"-e")) {
+            config.showerrors = 1;
         } else if (!strcmp(argv[i],"-t")) {
             if (lastarg) goto invalid;
             /* We get the list of tests to run as a string in the form
@@ -533,6 +571,11 @@ int parseOptions(int argc, const char **argv) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
             config.dbnumstr = sdsfromlonglong(config.dbnum);
+        } else if (!strcmp(argv[i],"--precision")) {
+            if (lastarg) goto invalid;
+            config.precision = atoi(argv[++i]);
+            if (config.precision < 0) config.precision = 0;
+            if (config.precision > MAX_LATENCY_PRECISION) config.precision = MAX_LATENCY_PRECISION;
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -552,15 +595,15 @@ invalid:
 
 usage:
     printf(
-"Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests]> [-k <boolean>]\n\n"
+"Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests>] [-k <boolean>]\n\n"
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
 " -p <port>          Server port (default 6379)\n"
 " -s <socket>        Server socket (overrides host and port)\n"
 " -a <password>      Password for Redis Auth\n"
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 100000)\n"
-" -d <size>          Data size of SET/GET value in bytes (default 2)\n"
-" -dbnum <db>        SELECT the specified db number (default 0)\n"
+" -d <size>          Data size of SET/GET value in bytes (default 3)\n"
+" --dbnum <db>       SELECT the specified db number (default 0)\n"
 " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
 " -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD\n"
 "  Using this option the benchmark will expand the string __rand_int__\n"
@@ -569,7 +612,10 @@ usage:
 "  is executed. Default tests use this to hit random keys in the\n"
 "  specified range.\n"
 " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
+" -e                 If server replies with errors, show them on stdout.\n"
+"                    (no more than 1 error per second is displayed)\n"
 " -q                 Quiet. Just show query/sec values\n"
+" --precision        Number of decimal places to display in latency output (default 0)\n"
 " --csv              Output in CSV format\n"
 " -l                 Loop. Run the tests forever\n"
 " -t <tests>         Only run the comma separated list of tests. The test\n"
@@ -599,7 +645,7 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
     UNUSED(id);
     UNUSED(clientData);
 
-    if (config.liveclients == 0) {
+    if (config.liveclients == 0 && config.requests_finished != config.requests) {
         fprintf(stderr,"All clients disconnected... aborting.\n");
         exit(1);
     }
@@ -649,6 +695,7 @@ int main(int argc, const char **argv) {
     config.keepalive = 1;
     config.datasize = 3;
     config.pipeline = 1;
+    config.showerrors = 0;
     config.randomkeys = 0;
     config.randomkeys_keyspacelen = 0;
     config.quiet = 0;
@@ -663,6 +710,7 @@ int main(int argc, const char **argv) {
     config.tests = NULL;
     config.dbnum = 0;
     config.auth = NULL;
+    config.precision = 1;
 
     i = parseOptions(argc,argv);
     argc -= i;
@@ -760,6 +808,13 @@ int main(int argc, const char **argv) {
             len = redisFormatCommand(&cmd,
                 "SADD myset element:__rand_int__");
             benchmark("SADD",cmd,len);
+            free(cmd);
+        }
+
+        if (test_is_selected("hset")) {
+            len = redisFormatCommand(&cmd,
+                "HSET myset:__rand_int__ element:__rand_int__ %s",data);
+            benchmark("HSET",cmd,len);
             free(cmd);
         }
 
