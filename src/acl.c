@@ -888,6 +888,22 @@ int ACLCheckUserCredentials(robj *username, robj *password) {
     return C_ERR;
 }
 
+/* This is like ACLCheckUserCredentials(), however if the user/pass
+ * are correct, the connection is put in authenticated state and the
+ * connection user reference is populated.
+ *
+ * The return value is C_OK or C_ERR with the same meaning as
+ * ACLCheckUserCredentials(). */
+int ACLAuthenticateUser(client *c, robj *username, robj *password) {
+    if (ACLCheckUserCredentials(username,password) == C_OK) {
+        c->authenticated = 1;
+        c->user = ACLGetUserByName(username->ptr,sdslen(username->ptr));
+        return C_OK;
+    } else {
+        return C_ERR;
+    }
+}
+
 /* For ACL purposes, every user has a bitmap with the commands that such
  * user is allowed to execute. In order to populate the bitmap, every command
  * should have an assigned ID (that is used to index the bitmap). This function
@@ -1373,23 +1389,38 @@ void ACLLoadUsersAtStartup(void) {
  * ACL SETUSER <username> ... acl rules ...
  * ACL DELUSER <username> [...]
  * ACL GETUSER <username>
+ * ACL GENPASS
+ * ACL WHOAMI
  */
 void aclCommand(client *c) {
     char *sub = c->argv[1]->ptr;
     if (!strcasecmp(sub,"setuser") && c->argc >= 3) {
         sds username = c->argv[2]->ptr;
+        /* Create a temporary user to validate and stage all changes against
+         * before applying to an existing user or creating a new user. If all
+         * arguments are valid the user parameters will all be applied together.
+         * If there are any errors then none of the changes will be applied. */
+        user *tempu = ACLCreateUnlinkedUser();
         user *u = ACLGetUserByName(username,sdslen(username));
-        if (!u) u = ACLCreateUser(username,sdslen(username));
-        serverAssert(u != NULL);
+        if (u) ACLCopyUser(tempu, u);
+
         for (int j = 3; j < c->argc; j++) {
-            if (ACLSetUser(u,c->argv[j]->ptr,sdslen(c->argv[j]->ptr)) != C_OK) {
+            if (ACLSetUser(tempu,c->argv[j]->ptr,sdslen(c->argv[j]->ptr)) != C_OK) {
                 char *errmsg = ACLSetUserStringError();
                 addReplyErrorFormat(c,
                     "Error in ACL SETUSER modifier '%s': %s",
                     (char*)c->argv[j]->ptr, errmsg);
+
+                ACLFreeUser(tempu);
                 return;
             }
         }
+
+        /* Overwrite the user with the temporary user we modified above. */
+        if (!u) u = ACLCreateUser(username,sdslen(username));
+        serverAssert(u != NULL);
+        ACLCopyUser(u, tempu);
+        ACLFreeUser(tempu);
         addReply(c,shared.ok);
     } else if (!strcasecmp(sub,"deluser") && c->argc >= 3) {
         int deleted = 0;
@@ -1542,6 +1573,10 @@ void aclCommand(client *c) {
         }
         dictReleaseIterator(di);
         setDeferredArrayLen(c,dl,arraylen);
+    } else if (!strcasecmp(sub,"genpass") && c->argc == 2) {
+        char pass[32]; /* 128 bits of actual pseudo random data. */
+        getRandomHexChars(pass,sizeof(pass));
+        addReplyBulkCBuffer(c,pass,sizeof(pass));
     } else if (!strcasecmp(sub,"help")) {
         const char *help[] = {
 "LOAD                              -- Reload users from the ACL file.",
@@ -1552,6 +1587,7 @@ void aclCommand(client *c) {
 "DELUSER <username> [...]          -- Delete a list of users.",
 "CAT                               -- List available categories.",
 "CAT <category>                    -- List commands inside category.",
+"GENPASS                           -- Generate a secure user password.",
 "WHOAMI                            -- Return the current connection username.",
 NULL
         };
@@ -1572,3 +1608,47 @@ void addReplyCommandCategories(client *c, struct redisCommand *cmd) {
     }
     setDeferredSetLen(c, flaglen, flagcount);
 }
+
+/* AUTH <passowrd>
+ * AUTH <username> <password> (Redis >= 6.0 form)
+ *
+ * When the user is omitted it means that we are trying to authenticate
+ * against the default user. */
+void authCommand(client *c) {
+    /* Only two or three argument forms are allowed. */
+    if (c->argc > 3) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+    /* Handle the two different forms here. The form with two arguments
+     * will just use "default" as username. */
+    robj *username, *password;
+    if (c->argc == 2) {
+        /* Mimic the old behavior of giving an error for the two commands
+         * from if no password is configured. */
+        if (DefaultUser->flags & USER_FLAG_NOPASS) {
+            addReplyError(c,"AUTH <password> called without any password "
+                            "configured for the default user. Are you sure "
+                            "your configuration is correct?");
+            return;
+        }
+
+        username = createStringObject("default",7);
+        password = c->argv[1];
+    } else {
+        username = c->argv[1];
+        password = c->argv[2];
+    }
+
+    if (ACLAuthenticateUser(c,username,password) == C_OK) {
+        addReply(c,shared.ok);
+    } else {
+        addReplyError(c,"-WRONGPASS invalid username-password pair");
+    }
+
+    /* Free the "default" string object we created for the two
+     * arguments form. */
+    if (c->argc == 2) decrRefCount(username);
+}
+
